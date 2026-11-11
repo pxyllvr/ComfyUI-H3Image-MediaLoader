@@ -1,0 +1,1849 @@
+"""HTTP routes backing the Media Loader's drag-drop and file picker."""
+
+import asyncio
+import filecmp
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import time
+
+from . import media_io
+
+try:
+    from server import PromptServer
+    from aiohttp import web
+except Exception:  # pragma: no cover - only outside ComfyUI
+    PromptServer = None
+    web = None
+
+try:
+    import folder_paths
+except Exception:  # pragma: no cover
+    folder_paths = None
+
+SUBFOLDER = "h3image_media"
+# The RefMod Create tab's own uploads: a RefMod holds all it needs once made,
+# so they're deleted then, apart from the Media Loader's files.
+REFMOD_UPLOADS = f"{SUBFOLDER}/refmod_uploads"
+
+# One random token per server process. Every state-changing route demands it
+# in a request header; the frontend fetches it from a same-origin GET. A page
+# on another origin can send a POST but cannot read that GET's response, so it
+# can never learn the header value. That is the synchronizer-token pattern —
+# the mitigation the registry's review names outright ("no server-minted
+# CSRF token") — and unlike the Sec-Fetch-Site check it does not fall open
+# for requests that arrive without browser headers.
+_TOKEN = secrets.token_urlsafe(32)
+TOKEN_HEADER = "X-H3Image-Token"
+
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg"}
+AUDIO_EXT = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+
+
+def kind_for(name):
+    ext = os.path.splitext(name)[1].lower()
+    if ext in IMAGE_EXT:
+        return "picture"
+    if ext in VIDEO_EXT:
+        return "video"
+    if ext in AUDIO_EXT:
+        return "audio"
+    return None
+
+
+def _safe(name):
+    name = os.path.basename(name or "")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "upload"
+    return name[:120]
+
+
+def _target_dir(sub=SUBFOLDER):
+    base = folder_paths.get_input_directory() if folder_paths else "input"
+    path = os.path.join(base, sub)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _storage_base():
+    """The user-data root every store hangs off: user dir, else output dir,
+    else the pack dir (dev fallback — wiped on update, better than nothing)."""
+    base = None
+    if folder_paths is not None:
+        for getter in ("get_user_directory", "get_output_directory"):
+            fn = getattr(folder_paths, getter, None)
+            if callable(fn):
+                try:
+                    base = fn()
+                    break
+                except Exception:
+                    continue
+    return base
+
+
+def _preset_dir():
+    """Presets live with the user's data so they survive extension updates."""
+    base = _storage_base()
+    if not base:
+        base = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base, "h3image_presets")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _refmod_preset_dir():
+    """Saved RefMod stacks (picks with their weights), beside the media presets."""
+    base = _storage_base()
+    if not base:
+        base = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base, "h3image_refmod_presets")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _prompt_dir():
+    base = _storage_base()
+    if not base:
+        base = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base, "h3image_prompts")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _pack_version():
+    """Version from pyproject.toml, so the UI can report the running build.
+
+    A bug report that says "1.5.4" is only useful if 1.5.4 means one thing;
+    reading it from the file the registry publishes keeps them in step.
+    """
+    try:
+        import tomllib
+    except Exception:                       # Python < 3.11
+        try:
+            import tomli as tomllib
+        except Exception:
+            return "unknown"
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "pyproject.toml")
+        with open(path, "rb") as fh:
+            return str(tomllib.load(fh)["project"]["version"])
+    except Exception:
+        return "unknown"
+
+
+def _phrase_file():
+    """One JSON file holding every saved phrase.
+
+    Phrases are short and there may be many, so a single file beats a file
+    each — unlike prompts, which are large and edited one at a time.
+    """
+    return os.path.join(os.path.dirname(_prompt_dir()), "h3image_phrases.json")
+
+
+def _read_phrases():
+    try:
+        with open(_phrase_file(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _write_phrases(items):
+    path = _phrase_file()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(items, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)          # never leave a half-written library
+
+
+def _slug(text):
+    out = re.sub(r"[^A-Za-z0-9 ._-]+", "_", str(text or "")).strip(" ._-")
+    return out[:80] or None
+
+
+def _host_port(value):
+    """('host', port or None) from a Host header or an Origin's authority.
+
+    Parsed by hand rather than with a URL library: a browser only ever sends
+    `host[:port]` or `[ipv6]:port`, and anything else is refused rather
+    than guessed at. Userinfo never appears in either header."""
+    v = (value or "").strip().lower()
+    if not v or "@" in v:
+        return "", None
+    if v.startswith("["):                       # [ipv6] or [ipv6]:port
+        end = v.find("]")
+        if end < 0:
+            return "", None
+        host, rest = v[1:end], v[end + 1:]
+    else:
+        host, sep, port = v.partition(":")
+        rest = (":" + port) if sep else ""
+    if not host:
+        return "", None
+    if not rest:
+        return host, None
+    if not rest.startswith(":") or not rest[1:].isdigit():
+        return "", None
+    return host, int(rest[1:])
+
+
+def _same_authority(origin, host_header):
+    """Does an Origin header name the host this request arrived at?
+
+    `Origin: null` (an opaque or sandboxed origin) never matches. A default
+    port left implicit on one side still matches the same port stated on
+    the other, so `http://host` and `Host: host:80` agree."""
+    origin = (origin or "").strip()
+    if not origin or origin.lower() == "null":
+        return False
+    scheme, sep, rest = origin.partition("://")
+    if not sep:
+        return False
+    o_host, o_port = _host_port(rest.split("/", 1)[0])
+    h_host, h_port = _host_port(host_header)
+    if not o_host or not h_host or o_host != h_host:
+        return False
+    default = 443 if scheme.strip().lower() == "https" else 80
+    return (o_port or default) == (h_port or default)
+
+
+def _contained(path, directory):
+    """True when `path` resolves to a file strictly inside `directory`.
+
+    _slug() already strips separators, so these paths cannot escape today —
+    but that guarantee lives two functions away from the os.remove that
+    depends on it. Asserting it again where the path is minted (and once more
+    beside each destructive call) keeps the property local and survivable
+    through refactors.
+    """
+    real = os.path.realpath(path)
+    root = os.path.realpath(directory)
+    return real.startswith(root + os.sep)
+
+
+def _prompt_path(entry_id):
+    slug = _slug(entry_id)
+    if not slug:
+        return None, None
+    directory = _prompt_dir()
+    path = os.path.join(directory, slug + ".json")
+    if not _contained(path, directory):
+        return None, None
+    return slug, path
+
+
+def _draft_dir():
+    """Scratch drafts live beside the user libraries but in their own
+    directory, so no listing route can ever surface them: the library and
+    preset routes simply never look here. One JSON file holds every draft,
+    keyed by a node-minted id — thousands of tiny files was the failure mode
+    this avoids."""
+    base = _storage_base()
+    if not base:
+        base = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base, "h3image_drafts")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _drafts_file():
+    return os.path.join(_draft_dir(), "drafts.json")
+
+
+DRAFT_CAP = 25          # LRU by updated stamp; abandoned drafts fall off
+
+# Fields that describe the reference set itself. Anything outside this list —
+# uid (per-session identity), learned dimensions, cached probe data — must not
+# make two otherwise-identical sets look different.
+def _canonical_items(items):
+    """The comparable shape of a media set, order preserved because
+    reference numbering is positional.
+
+    Compares EFFECTIVE values, not literal ones. A field that is absent and
+    a field that holds its default describe the same reference set, and the
+    two turn up on opposite sides constantly: presets/load backfills
+    audio_mode and probe data into items whose stored form never had them,
+    so a freshly loaded preset would otherwise never match the file it came
+    from — every load reported itself as edited."""
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        row = {"kind": it.get("kind"), "file": it.get("file"),
+               "name": it.get("name") or it.get("file")}
+        # Absent means on; only "enabled": false switches an item off.
+        row["enabled"] = it.get("enabled") is not False
+        # nodes.py reads a missing audio_mode as "paired"; so must this.
+        if it.get("kind") == "video":
+            row["audio_mode"] = it.get("audio_mode") or "paired"
+        # Empty edits are the same as no edits.
+        for k in ("trim", "crop", "size"):
+            v = it.get(k)
+            if v:
+                row[k] = v
+        for k in ("rotate", "mirror"):
+            v = it.get(k)
+            if v:
+                row[k] = v
+        out.append(row)
+    return out
+
+
+def _set_digest(items):
+    blob = json.dumps(_canonical_items(items), sort_keys=True,
+                      separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _read_drafts():
+    try:
+        with open(_drafts_file(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("drafts"), dict):
+            return data
+    except Exception:
+        pass
+    return {"contract": 1, "drafts": {}}
+
+
+def _write_json(path, record):
+    """Write via a sibling tmp file: a crash mid-write must not corrupt the
+    file, because the readers treat corrupt JSON as "no entry" and the prompt
+    or preset silently vanishes from its list."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def _read_prompt(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _preset_path(name):
+    safe = re.sub(r"[^A-Za-z0-9 ._-]+", "_", str(name or "")).strip(" ._-")
+    if not safe:
+        return None, None
+    directory = _preset_dir()
+    path = os.path.join(directory, safe[:80] + ".json")
+    if not _contained(path, directory):
+        return None, None
+    return safe[:80], path
+
+
+def _refmod_preset_path(name):
+    safe = re.sub(r"[^A-Za-z0-9 ._-]+", "_", str(name or "")).strip(" ._-")
+    if not safe:
+        return None, None
+    directory = _refmod_preset_dir()
+    path = os.path.join(directory, safe[:80] + ".json")
+    if not _contained(path, directory):
+        return None, None
+    return safe[:80], path
+
+
+def _clean_picks(picks):
+    """The parts of a RefMod stack a preset keeps: what the Prompt Builder
+    and the stack node read. Previews and ids are re-derived on load."""
+    out = []
+    for p in picks if isinstance(picks, list) else []:
+        if not isinstance(p, dict):
+            continue
+        item = {"name": str(p.get("name") or "")[:300], "label": str(p.get("label") or "")[:200],
+                "on": p.get("on") is not False}
+        for key in ("visual", "audio"):
+            ch = p.get(key)
+            if not isinstance(ch, dict) or not ch.get("file"):
+                continue
+            keep = {"file": str(ch["file"])[:300], "kind": str(ch.get("kind") or "")[:16],
+                    "mode": "sc" if ch.get("mode") == "sc" else "weight"}
+            for k in ("w", "s", "c", "tokens", "seconds"):
+                if ch.get(k) is not None:
+                    try:
+                        keep[k] = float(ch[k])
+                    except (TypeError, ValueError):
+                        pass
+            item[key] = keep
+        if "visual" in item or "audio" in item:
+            out.append(item)
+    return out
+
+
+def _picks_digest(picks):
+    """What the model would receive: files and strengths in send order."""
+    from . import refmods
+    canon = [refmods.pick_channels(p) for p in _clean_picks(picks) if p.get("on") is not False]
+    blob = json.dumps(canon, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _unique(directory, name):
+    stem, ext = os.path.splitext(name)
+    candidate = name
+    if os.path.exists(os.path.join(directory, candidate)):
+        candidate = f"{stem}_{int(time.time() * 1000) % 100000}{ext}"
+    return candidate
+
+
+def _same_file(directory, path, size, kind, wanted):
+    """A file already in `directory` with exactly the bytes of `path`: the
+    same media loaded again, under its own name or another. Only files of
+    the same size are read. Of several copies, `wanted` (the name it would
+    get) comes first, then the shortest name, so the original wins over the
+    _12345 copies older versions made."""
+    names = sorted((e.name for e in os.scandir(directory) if e.is_file() and not e.name.startswith(".")
+                    and kind_for(e.name) == kind and e.stat().st_size == size),
+                   key=lambda n: (n != wanted, len(n), n))
+    return next((n for n in names if filecmp.cmp(os.path.join(directory, n), path, shallow=False)), None)
+
+
+if PromptServer is not None and web is not None:
+
+    routes = PromptServer.instance.routes
+
+    def _cross_origin(request):
+        """Is this request provably from another web origin?
+
+        ComfyUI core's origin_only_middleware rejects Sec-Fetch-Site:
+        cross-site, but its Host/Origin comparison is deliberately limited to
+        loopback hosts — on a `--listen` LAN install only the Sec-Fetch-Site
+        half applies, and every route here mutates state, so each carries its
+        own guard rather than inheriting one from core.
+
+        Modern browsers always send Sec-Fetch-Site; when it is present it is
+        authoritative, and only `same-origin` (this pack's own frontend) and
+        `none` (the user typing the URL) pass. `same-site` is refused too: it
+        is still another origin — another port on the same host, another
+        service on the same LAN address, a sibling subdomain — and under
+        `--enable-cors-header` such a page could otherwise read the token.
+        That matches the fallback for older browsers that omit the header,
+        where Origin must name this exact host and port. Requests with
+        neither header (curl, scripts, the queue itself) are not
+        browser-mediated and pass.
+        """
+        sfs = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if sfs:
+            return sfs not in ("same-origin", "none")
+        origin = (request.headers.get("Origin") or "").strip()
+        if not origin:
+            return False
+        return not _same_authority(origin, request.headers.get("Host"))
+
+    # A refused request only ever reached the browser, so a user reporting
+    # "missing or stale session token" left nothing in the ComfyUI log to go
+    # on. Each refusal now prints one line naming the route and which check
+    # failed — never the token — at most once a minute per route and reason,
+    # so a page retrying in a loop can't flood the console.
+    _REFUSAL_WINDOW = 60.0
+    _refusals = {}
+
+    def _log_refusal(request, kind, reason):
+        key = (request.method, request.path, kind)
+        now = time.monotonic()
+        last, quiet = _refusals.get(key, (None, 0))
+        if last is not None and now - last < _REFUSAL_WINDOW:
+            _refusals[key] = (last, quiet + 1)
+            return
+        _refusals[key] = (now, 0)
+        more = f" ({quiet} more like it in the last minute)" if quiet else ""
+        print(f"[MiniMaxH3] refused {request.method} {request.path}: {reason}{more}", flush=True)
+
+    def _guard(json_only=True):
+        """Route decorator: refuse cross-origin or token-less requests before
+        the handler runs.
+
+        Three checks, cheapest first. The Sec-Fetch-Site/Origin test rejects
+        anything a browser marks as another origin. The token check rejects
+        anything that did not first read /h3image/token from this origin
+        — which is every other origin's page, and every request that simply
+        omits browser headers. `json_only` additionally requires
+        Content-Type: application/json, which makes the request non-"simple"
+        under CORS so a cross-origin page cannot send it without a preflight
+        these routes never approve.
+        """
+        def wrap(handler):
+            async def inner(request):
+                if _cross_origin(request):
+                    _log_refusal(request, "cross-origin", "cross-origin request (Sec-Fetch-Site "
+                                 f"{request.headers.get('Sec-Fetch-Site') or 'absent'}, Origin "
+                                 f"{(request.headers.get('Origin') or 'absent')[:80]}, Host "
+                                 f"{(request.headers.get('Host') or 'absent')[:80]})")
+                    return web.json_response(
+                        {"error": "cross-origin request refused"}, status=403)
+                sent = request.headers.get(TOKEN_HEADER) or ""
+                if not hmac.compare_digest(sent, _TOKEN):
+                    _log_refusal(request, "token-absent" if not sent else "token-mismatch", (
+                        f"session token: the {TOKEN_HEADER} header never arrived — a proxy, "
+                        "tunnel or another custom node may be removing it" if not sent else
+                        f"session token: {TOKEN_HEADER} does not match this server's — expected once "
+                        "from a page left open across a restart (it fetches a fresh token and retries); "
+                        "if it repeats, requests are reaching a different ComfyUI process"))
+                    return web.json_response(
+                        {"error": "missing or stale session token",
+                         "token_required": True}, status=403)
+                if json_only:
+                    ctype = (request.headers.get("Content-Type") or "") \
+                        .split(";")[0].strip().lower()
+                    if ctype != "application/json":
+                        _log_refusal(request, "content-type", f"content type: expected application/json, got "
+                                              f"{ctype[:60] or 'none'}")
+                        return web.json_response(
+                            {"error": "expected Content-Type: application/json"},
+                            status=415)
+                return await handler(request)
+            inner.__name__ = handler.__name__
+            inner.__doc__ = handler.__doc__
+            return inner
+        return wrap
+
+    @routes.get("/h3image/token")
+    async def token(request):
+        """Hand the session token to same-origin callers only.
+
+        The cross-origin check matters here even though this is a GET: with
+        `--enable-cors-header` a permissive CORS policy would otherwise let
+        another origin read this response and defeat the token.
+        """
+        if _cross_origin(request):
+            _log_refusal(request, "cross-origin", "cross-origin token request (Sec-Fetch-Site "
+                         f"{request.headers.get('Sec-Fetch-Site') or 'absent'}, Origin "
+                         f"{(request.headers.get('Origin') or 'absent')[:80]})")
+            return web.json_response(
+                {"error": "cross-origin request refused"}, status=403)
+        return web.json_response({"token": _TOKEN},
+                                 headers={"Cache-Control": "no-store"})
+
+    @routes.post("/h3image/upload")
+    @_guard(json_only=False)
+    async def upload(request):
+        """Accept one file, store it under input/h3image (?for=refmod: the
+        RefMod Create tab's own folder), return its metadata."""
+        try:
+            reader = await request.multipart()
+        except Exception:
+            return web.json_response({"error": "expected multipart form data"},
+                                     status=400)
+        field = await reader.next()
+        while field is not None and field.name != "file":
+            field = await reader.next()
+        if field is None:
+            return web.json_response({"error": "no file field in request"}, status=400)
+
+        original = field.filename or "upload"
+        kind = kind_for(original)
+        if kind is None:
+            return web.json_response(
+                {"error": f"unsupported file type: {os.path.splitext(original)[1]}"},
+                status=400)
+
+        sub = REFMOD_UPLOADS if request.query.get("for") == "refmod" else SUBFOLDER
+        directory = _target_dir(sub)
+        part = os.path.join(directory, f".upload-{secrets.token_hex(8)}.part")
+        size = 0
+        try:
+            with open(part, "wb") as fh:
+                while True:
+                    chunk = await field.read_chunk()
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    fh.write(chunk)
+            # the same media again keeps the one copy already here, like the input folder
+            name = await asyncio.to_thread(_same_file, directory, part, size, kind, _safe(original))
+            if name:
+                os.remove(part)
+            else:
+                name = _unique(directory, _safe(original))
+                os.replace(part, os.path.join(directory, name))
+        except Exception as exc:
+            if os.path.exists(part):
+                os.remove(part)
+            return web.json_response({"error": f"write failed: {exc}"}, status=500)
+
+        annotated = f"{sub}/{name} [input]"
+        info = media_io.probe(annotated) if kind in ("video", "audio") else {}
+        return web.json_response({
+            "file": annotated,
+            "name": name,
+            "original": original,
+            "kind": kind,
+            "size": size,
+            "duration": info.get("duration"),
+            "has_audio": bool(info.get("has_audio")),
+            "width": info.get("width"),
+            "height": info.get("height"),
+        })
+
+    @routes.post("/h3image/refmod_uploads/sweep")
+    @_guard()
+    async def refmod_uploads_sweep(request):
+        """Delete the Create tab's uploads nothing needs now: with `files`, the
+        ones a finished job (`prompt_id`) used; without, any left over a day.
+        Files the tab still lists (`keep`) and any a queued or running prompt
+        names stay."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        prefix = REFMOD_UPLOADS + "/"
+        mine = lambda f: os.path.basename(str(f).split(" [")[0]) if str(f).startswith(prefix) else None
+        folder = _target_dir(REFMOD_UPLOADS)
+        files = body.get("files")
+        if isinstance(files, list):
+            names = {mine(f) for f in files} - {None}
+        else:
+            stale = time.time() - 86400
+            names = {e.name for e in os.scandir(folder) if e.is_file() and e.stat().st_mtime < stale}
+        running, pending = PromptServer.instance.prompt_queue.get_current_queue()
+        queued = json.dumps([q[2] for q in running + pending if q[1] != body.get("prompt_id")], default=str)
+        removed = 0
+        for name in names - {mine(f) for f in body.get("keep") or []}:
+            path = os.path.join(folder, name)
+            if not name.startswith(".") and name not in queued and os.path.isfile(path):
+                os.remove(path)
+                removed += 1
+        return web.json_response({"removed": removed})
+
+    @routes.post("/h3image/extract_audio")
+    @_guard()
+    async def extract_audio_route(request):
+        """Write the trimmed audio of an existing item out as its own WAV.
+
+        Decoding goes through media_io, so this inherits the same channel and
+        scale handling as every other audio path in the pack.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+
+        annotated = str(body.get("file") or "")
+        if not annotated:
+            return web.json_response({"error": "no file given"}, status=400)
+        try:
+            start = float(body.get("start") or 0.0)
+        except (TypeError, ValueError):
+            start = 0.0
+        end = body.get("end")
+        try:
+            end = float(end) if end is not None else None
+        except (TypeError, ValueError):
+            end = None
+
+        kind = kind_for(annotated)
+        try:
+            if kind == "video":
+                data = media_io.extract_audio(annotated, start=start, end=end)
+            else:
+                data = media_io.load_audio(annotated, start=start, end=end)
+        except Exception as exc:
+            return web.json_response(
+                {"error": f"couldn't read audio from that clip: {exc}"}, status=400)
+
+        wave = data.get("waveform")
+        rate = int(data.get("sample_rate") or 0)
+        if wave is None or not rate:
+            return web.json_response({"error": "that clip has no audio"}, status=400)
+
+        try:
+            import numpy as np
+
+            arr = wave.detach().cpu().numpy() if hasattr(wave, "detach") else wave
+            arr = np.asarray(arr)
+            while arr.ndim > 2:                 # [1, C, N] -> [C, N]
+                arr = arr[0]
+            if arr.ndim == 1:
+                arr = arr[None, :]
+            if arr.shape[1] == 0:
+                return web.json_response({"error": "that range is empty"}, status=400)
+            peak = float(np.abs(arr).max()) or 1.0
+            if peak > 1.0:                      # belt and braces; media_io guards too
+                arr = arr / peak
+            pcm = (np.clip(arr, -1.0, 1.0) * 32767.0).astype("<i2")
+            interleaved = pcm.T.reshape(-1)     # [C, N] -> L,R,L,R...
+        except Exception as exc:
+            return web.json_response({"error": f"conversion failed: {exc}"}, status=500)
+
+        base = os.path.splitext(os.path.basename(annotated.split(" [")[0]))[0]
+        span = f"{start:.2f}".replace(".", "-")
+        directory = _target_dir()
+        name = _unique(directory, _safe(f"{base}_audio_{span}s.wav"))
+        path = os.path.join(directory, name)
+        try:
+            import wave as wavemod
+
+            with wavemod.open(path, "wb") as fh:
+                fh.setnchannels(int(arr.shape[0]))
+                fh.setsampwidth(2)
+                fh.setframerate(rate)
+                fh.writeframes(interleaved.tobytes())
+        except Exception as exc:
+            if os.path.exists(path):
+                os.remove(path)
+            return web.json_response({"error": f"write failed: {exc}"}, status=500)
+
+        out = f"{SUBFOLDER}/{name} [input]"
+        info = media_io.probe(out)
+        print(f"[MiniMaxH3] extracted audio -> {name} "
+              f"({arr.shape[0]}ch {rate}Hz {arr.shape[1] / rate:.2f}s)")
+        return web.json_response({
+            "file": out, "name": name, "original": name, "kind": "audio",
+            "duration": info.get("duration"), "has_audio": True,
+        })
+
+    @routes.post("/h3image/bake")
+    @_guard()
+    async def bake(request):
+        """Write a resized copy of a picture and hand back the new file.
+
+        Explicit only: nothing calls this on upload or on render. The source
+        file is left exactly as it was — the copy is a new entry in the input
+        folder, so the original stays usable elsewhere.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+
+        annotated = str(body.get("file") or "")
+        try:
+            cap = int(body.get("resize") or 0)
+        except (TypeError, ValueError):
+            cap = 0
+        if not annotated:
+            return web.json_response({"error": "no file given"}, status=400)
+        has_edit = bool(body.get("crop") or body.get("mirror")
+                        or int(body.get("rotate") or 0) % 360)
+        if cap <= 0 and not has_edit:
+            return web.json_response(
+                {"error": "nothing to write: set a size, crop, rotation or "
+                          "mirror first"}, status=400)
+
+        try:
+            from PIL import Image, ImageOps
+
+            path = media_io.resolve(annotated)
+            img = Image.open(path)
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            was = img.size
+            turn = int(body.get("rotate") or 0) % 360
+            if turn in (90, 180, 270):
+                img = img.rotate(-turn, expand=True)
+            if body.get("mirror"):
+                img = ImageOps.mirror(img)
+            crop = body.get("crop")
+            if isinstance(crop, dict):
+                W, H = img.size
+                x0 = max(0, min(W - 16, int(round(float(crop.get("x", 0)) * W))))
+                y0 = max(0, min(H - 16, int(round(float(crop.get("y", 0)) * H))))
+                x1 = min(W, max(x0 + 16,
+                         int(round((float(crop.get("x", 0)) + float(crop.get("w", 1))) * W))))
+                y1 = min(H, max(y0 + 16,
+                         int(round((float(crop.get("y", 0)) + float(crop.get("h", 1))) * H))))
+                if (x0, y0, x1, y1) != (0, 0, W, H):
+                    img = img.crop((x0, y0, x1, y1))
+            w, h = img.size
+            # cap == 0 means "no size cap" — a crop-only copy. Without the
+            # cap > 0 test the scale factor became 0 and every copy came out
+            # as the 16px floor.
+            if cap > 0 and max(w, h) > cap:
+                k = cap / float(max(w, h))
+                img = img.resize((max(16, int(round(w * k))),
+                                  max(16, int(round(h * k)))), Image.LANCZOS)
+        except Exception as exc:
+            return web.json_response({"error": f"couldn't read that picture: {exc}"},
+                                     status=400)
+
+        base = os.path.splitext(os.path.basename(annotated.split(" [")[0]))[0]
+        name = _unique(_target_dir(), _safe(f"{base}_{img.size[0]}x{img.size[1]}.png"))
+        out_path = os.path.join(_target_dir(), name)
+        try:
+            img.save(out_path, "PNG")
+        except Exception as exc:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            return web.json_response({"error": f"couldn't write: {exc}"}, status=500)
+
+        out = f"{SUBFOLDER}/{name} [input]"
+        print(f"[MiniMaxH3] baked {was[0]}x{was[1]} -> {img.size[0]}x{img.size[1]} "
+              f"as {name}")
+        return web.json_response({
+            "file": out, "name": name,
+            "width": img.size[0], "height": img.size[1],
+            "was": [was[0], was[1]],
+        })
+
+    def _output_root():
+        if folder_paths is None:
+            raise RuntimeError("folder_paths unavailable")
+        return os.path.realpath(folder_paths.get_output_directory())
+
+    def _safe_dir(rel):
+        """Resolve a browser path, refusing anything outside the output dir."""
+        root = _output_root()
+        target = os.path.realpath(os.path.join(root, rel or ""))
+        if target != root and not target.startswith(root + os.sep):
+            return root, ""                     # escape attempt -> back to root
+        if target == root:
+            return root, ""
+        return target, os.path.relpath(target, root).replace(os.sep, "/")
+
+    @routes.get("/h3image/browse")
+    async def browse(request):
+        """List folders under the output directory, for the folder picker."""
+        rel = request.query.get("path", "")
+        try:
+            target, rel = _safe_dir(rel)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        dirs = []
+        try:
+            with os.scandir(target) as it:
+                for entry in it:
+                    if entry.is_dir() and not entry.name.startswith("."):
+                        dirs.append(entry.name)
+        except Exception as exc:
+            return web.json_response({"error": f"unreadable: {exc}"}, status=500)
+        dirs.sort(key=str.lower)
+        return web.json_response({"path": "" if rel in (".", "") else rel,
+                                  "dirs": dirs})
+
+    @routes.post("/h3image/mkdir")
+    @_guard()
+    async def mkdir(request):
+        """Create a folder from the picker, inside the output directory."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name = re.sub(r"[^A-Za-z0-9 ._-]+", "_", str(body.get("name") or "")).strip()
+        if not name:
+            return web.json_response({"error": "give the folder a name"},
+                                     status=400)
+        try:
+            parent, _ = _safe_dir(body.get("path", ""))
+            path = os.path.realpath(os.path.join(parent, name))
+            root = _output_root()
+            if not path.startswith(root + os.sep):
+                return web.json_response({"error": "outside the output folder"},
+                                         status=400)
+            os.makedirs(path, exist_ok=True)
+        except Exception as exc:
+            return web.json_response({"error": f"could not create: {exc}"},
+                                     status=500)
+        return web.json_response({"created": name})
+
+    @routes.get("/h3image/capabilities")
+    async def capabilities(request):
+        caps = media_io.backends()
+        caps["video"] = media_io.can_decode_video()
+        caps["version"] = _pack_version()
+        return web.json_response(caps)
+
+    # -- RefMod library -----------------------------------------------------
+    # Read-only, so no session token: the same posture as /browse. Both
+    # routes resolve names through refmods.resolve_file, which refuses
+    # anything that does not land inside a registered RefMod root.
+
+    @routes.get("/h3image/refmods")
+    async def refmod_library(request):
+        """Every RefMod on disk, paired and costed, for the stack's browser."""
+        try:
+            from . import refmods
+            data = dict(refmods.scan_library())
+            data["pack_installed"] = refmods.origin_module() is not None
+            return web.json_response(data, headers={"Cache-Control": "no-store"})
+        except Exception as exc:
+            return web.json_response({"error": f"scan failed: {exc}"}, status=500)
+
+    @routes.get("/h3image/refmods/preview")
+    async def refmod_preview(request):
+        """The image saved beside a RefMod, for its thumbnail."""
+        from . import refmods
+        path = refmods.resolve_file(request.query.get("name", ""),
+                                    refmods.PREVIEW_EXT)
+        if not path:
+            return web.json_response({"error": "no preview"}, status=404)
+        return web.FileResponse(path, headers={"Cache-Control": "max-age=60"})
+
+    @routes.post("/h3image/refmods/rename")
+    @_guard()
+    async def refmod_rename(request):
+        """Move an item (its files, pair suffixes kept) to a new name/folder."""
+        from . import refmods
+        try:
+            body = await request.json()
+            moved = refmods.rename_item(body.get("files"), body.get("preview"),
+                                        body.get("new_name", ""))
+            return web.json_response({"moved": moved})
+        except (ValueError, FileNotFoundError, FileExistsError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"rename failed: {exc}"}, status=500)
+
+    @routes.post("/h3image/refmods/meta")
+    @_guard()
+    async def refmod_meta(request):
+        """Rewrite description / concept_type in each file's header."""
+        from . import refmods
+        try:
+            body = await request.json()
+            fields = {}
+            if "description" in body:
+                fields["description"] = str(body.get("description") or "")[:2000]
+            if "concept_type" in body:
+                fields["concept_type"] = str(body.get("concept_type") or "generic")[:40]
+            if "subject_name" in body:
+                fields["subject_name"] = refmods.clean_subject_name(body.get("subject_name"))
+            for key in ("appearance", "voice_description", "retained_attributes"):
+                if key in body:
+                    fields[key] = refmods.clean_description(body.get(key), key.replace("_", " "))
+            refmods.rewrite_meta(body.get("files"), **fields)
+            return web.json_response({"ok": True})
+        except (ValueError, FileNotFoundError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"update failed: {exc}"}, status=500)
+
+    @routes.post("/h3image/refmods/delete")
+    @_guard()
+    async def refmod_delete(request):
+        from . import refmods
+        try:
+            body = await request.json()
+            removed = refmods.delete_item(body.get("files"), body.get("preview"))
+            return web.json_response({"removed": removed})
+        except (ValueError, FileNotFoundError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"delete failed: {exc}"}, status=500)
+
+    # Masks, their overlay sprites and saved edit/reference latents pile up
+    # as people re-mask and change settings. These list and delete them; the
+    # page decides which are unused and asks before deleting.
+    def _edit_file_dirs():
+        try:
+            from .object_mask import SUBFOLDER as MASKS
+        except ImportError:
+            return {}
+        try:
+            from . import latent_cache
+            cache = os.path.realpath(os.path.join(folder_paths.get_input_directory(), latent_cache.SUBFOLDER))
+        except ImportError:
+            cache = None
+        base = folder_paths.get_input_directory()
+        out = {"mask": os.path.realpath(os.path.join(base, MASKS))}
+        if cache:
+            out["cache"] = cache
+        return out
+
+    def _saved_masks():
+        """Mask files named in saved media presets and Prompt Builder drafts,
+        which Clean up must keep even when no loader in the graph uses them."""
+        try:
+            from .object_mask import SUBFOLDER as MASKS
+        except ImportError:
+            return set()
+        pattern = re.compile(re.escape(MASKS) + r"/([A-Za-z0-9_.-]+\.(?:safetensors|png))")
+        folder = _preset_dir()
+        paths = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".json")] + [_drafts_file()]
+        names = set()
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    names.update(pattern.findall(fh.read()))
+            except OSError:
+                continue
+        return names
+
+    @routes.post("/h3image/mask_compose")
+    @_guard()
+    async def mask_compose(request):
+        """Draw the mask editor's layers into the clip's mask; returns it."""
+        try:
+            from . import object_mask
+        except ImportError:
+            return web.json_response({"error": "mask editing is not available in this pack"}, status=501)
+        try:
+            body = await request.json()
+            layers = body.get("layers")
+            if not isinstance(layers, list) or not layers or len(layers) > 64:
+                return web.json_response({"error": "expected 1 to 64 layers"}, status=400)
+            masks = _edit_file_dirs()["mask"]
+            for layer in layers:
+                result = layer.get("result") if isinstance(layer, dict) else None
+                if result and os.path.dirname(os.path.realpath(media_io.resolve(str(result)))) != masks:
+                    return web.json_response({"error": "a layer names something that isn't a mask file"}, status=400)
+            info = await asyncio.to_thread(object_mask.compose_layers, str(body.get("clip") or ""), layers,
+                                           float(body.get("start") or 0), float(body.get("end") or 0))
+            return web.json_response({"mask": info})
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"combining the layers failed: {exc}"}, status=500)
+
+    @routes.get("/h3image/edit_files")
+    async def edit_files(request):
+        out = []
+        saved = _saved_masks()
+        for kind, folder in _edit_file_dirs().items():
+            if not os.path.isdir(folder):
+                continue
+            for name in sorted(os.listdir(folder)):
+                path = os.path.join(folder, name)
+                if os.path.isfile(path) and name.endswith((".safetensors", ".png")):
+                    st = os.stat(path)
+                    out.append({"kind": kind, "name": name, "size": st.st_size, "mtime": int(st.st_mtime),
+                                "saved": kind == "mask" and name in saved})
+        return web.json_response({"files": out})
+
+    @routes.post("/h3image/edit_files/delete")
+    @_guard()
+    async def edit_files_delete(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON"}, status=400)
+        dirs = _edit_file_dirs()
+        saved = _saved_masks()
+        removed = []
+        for entry in body.get("files") or []:
+            folder = dirs.get((entry or {}).get("kind"))
+            name = os.path.basename(str((entry or {}).get("name") or ""))
+            if not folder or not name.endswith((".safetensors", ".png")) or name in saved:
+                continue
+            path = os.path.realpath(os.path.join(folder, name))
+            if os.path.dirname(path) != folder or not os.path.isfile(path):
+                continue
+            os.remove(path)
+            removed.append(name)
+        return web.json_response({"removed": removed})
+
+    @routes.post("/h3image/refmods/set_preview")
+    @_guard(json_only=False)
+    async def refmod_set_preview(request):
+        """Multipart: `stem` (relative name) + `file` (an image) -> <stem>.png."""
+        try:
+            from . import refmods
+        except ImportError:
+            return web.json_response({"error": "refmods are not available in this pack"}, status=501)
+        try:
+            reader = await request.multipart()
+            stem, data = "", None
+            field = await reader.next()
+            while field is not None:
+                if field.name == "stem":
+                    stem = (await field.text()).strip()
+                elif field.name == "file":
+                    chunks = []
+                    total = 0
+                    while True:
+                        chunk = await field.read_chunk()
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > 32 << 20:
+                            return web.json_response({"error": "image too large"}, status=413)
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                field = await reader.next()
+            if not data:
+                return web.json_response({"error": "no image"}, status=400)
+            saved = refmods.set_preview(stem, data)
+            return web.json_response({"preview": saved})
+        except (ValueError, FileNotFoundError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"preview failed: {exc}"}, status=500)
+
+    @routes.get("/h3image/presets")
+    async def list_presets(request):
+        """Presets with their categories.
+
+        Categories are a VIEW over one flat namespace, never folders: a
+        prompt links to a preset by name and the filename is the name, so
+        two presets sharing a name in different categories would collide on
+        disk and make the link ambiguous. Same rule the prompt library
+        follows."""
+        entries, categories = [], set()
+        base = _preset_dir()
+        try:
+            names = [f[:-5] for f in os.listdir(base) if f.endswith(".json")]
+        except Exception:
+            names = []
+        for n in sorted(names, key=str.lower):
+            data = _read_prompt(os.path.join(base, n + ".json")) or {}
+            cat = (data.get("category") or "").strip()
+            if cat:
+                categories.add(cat)
+            items = [i for i in (data.get("items") or []) if isinstance(i, dict)]
+            entries.append({
+                "name": n,
+                "category": cat,
+                "count": len(items),
+                "counts": {k: sum(1 for i in items
+                                  if i.get("kind") == k
+                                  and i.get("enabled") is not False)
+                           for k in ("picture", "video", "audio")},
+            })
+        return web.json_response({
+            "presets": entries,
+            # Kept so an older client (or a stale browser cache) still gets
+            # a usable list rather than an empty picker.
+            "names": [e["name"] for e in entries],
+            "categories": sorted(categories, key=str.lower),
+        })
+
+    @routes.post("/h3image/presets/save")
+    @_guard()
+    async def save_preset(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _preset_path(body.get("name"))
+        if not path:
+            return web.json_response({"error": "give the preset a name"}, status=400)
+        items = body.get("items")
+        if not isinstance(items, list):
+            return web.json_response({"error": "items must be a list"}, status=400)
+        previous = _read_prompt(path) or {}
+        # Absent category means "leave it alone" — re-saving a set from the
+        # loader shouldn't silently strip the category someone filed it under.
+        category = body.get("category")
+        if category is None:
+            category = previous.get("category") or ""
+        record = {"version": 1, "items": items,
+                  "category": str(category).strip()}
+        try:
+            _write_json(path, record)
+        except Exception as exc:
+            return web.json_response({"error": f"save failed: {exc}"}, status=500)
+        return web.json_response({"name": name, "count": len(items),
+                                  "category": record["category"]})
+
+    @routes.post("/h3image/presets/meta")
+    @_guard()
+    async def preset_meta(request):
+        """Set one preset's category without touching its items.
+
+        Without this the only way to file an existing preset is to load it
+        and save it again, which is a lot of ceremony for a label — and it
+        rewrites the items, so it can't be done safely from a picker."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _preset_path(body.get("name"))
+        if not path or not os.path.exists(path):
+            return web.json_response({"error": "preset not found"}, status=404)
+        data = _read_prompt(path)
+        if not data:
+            return web.json_response({"error": "preset unreadable"}, status=500)
+        data["category"] = str(body.get("category") or "").strip()
+        try:
+            _write_json(path, data)
+        except Exception as exc:
+            return web.json_response({"error": f"save failed: {exc}"}, status=500)
+        return web.json_response({"name": name, "category": data["category"]})
+
+    @routes.post("/h3image/presets/category")
+    @_guard()
+    async def preset_category(request):
+        """Rename a category across every preset, or clear it (to = "")."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        src_cat = (body.get("from") or "").strip()
+        dst_cat = (body.get("to") or "").strip()
+        if not src_cat:
+            return web.json_response({"error": "missing category"}, status=400)
+        base = _preset_dir()
+        changed = 0
+        try:
+            names = [f[:-5] for f in os.listdir(base) if f.endswith(".json")]
+        except Exception:
+            names = []
+        for n in names:
+            p = os.path.join(base, n + ".json")
+            data = _read_prompt(p)
+            if not data or (data.get("category") or "").strip() != src_cat:
+                continue
+            data["category"] = dst_cat
+            try:
+                _write_json(p, data)
+                changed += 1
+            except Exception:
+                pass
+        return web.json_response({"changed": changed})
+
+    @routes.post("/h3image/presets/match")
+    @_guard()
+    async def match_preset(request):
+        """Which saved preset, if any, IS this media set?
+
+        Asked server-side on purpose: the client would otherwise need its own
+        digest implementation that has to agree with this one forever, and
+        that kind of cross-language parity is where silent drift lives."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        items = body.get("items")
+        if not isinstance(items, list):
+            return web.json_response({"error": "items must be a list"}, status=400)
+        want = _set_digest(items)
+        base = _preset_dir()
+        try:
+            names = [f[:-5] for f in os.listdir(base) if f.endswith(".json")]
+        except Exception:
+            names = []
+        for n in sorted(names, key=str.lower):
+            data = _read_prompt(os.path.join(base, n + ".json")) or {}
+            if _set_digest(data.get("items")) == want:
+                return web.json_response({"name": n, "digest": want})
+        return web.json_response({"name": None, "digest": want})
+
+    @routes.post("/h3image/presets/load")
+    @_guard()
+    async def load_preset(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _preset_path(body.get("name"))
+        if not path or not os.path.exists(path):
+            return web.json_response({"error": "preset not found"}, status=404)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            return web.json_response({"error": f"unreadable preset: {exc}"},
+                                     status=500)
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return web.json_response({"error": "preset has no item list"},
+                                     status=500)
+        # Report files that have since been deleted rather than failing later.
+        kept, missing = [], []
+        for item in items:
+            target = item.get("file") if isinstance(item, dict) else None
+            if not target:
+                continue
+            try:
+                present = os.path.exists(media_io.resolve(target))
+            except Exception:
+                present = False     # resolve() now rejects out-of-bounds paths
+            if present:
+                kept.append(item)
+            else:
+                missing.append(item.get("name") or target)
+        # Presets saved before dimensions/duration were stored carry items
+        # with no width/height — the panel then shows thumbnails with no
+        # aspect data and leans on per-image learners to fill the gaps.
+        # Heal the data here instead: probe never raises, and items that
+        # already carry their metadata cost nothing.
+        for item in kept:
+            kind = item.get("kind")
+            needs = (not item.get("width") or not item.get("height")
+                     or (kind in ("video", "audio") and not item.get("duration"))
+                     or (kind == "video" and "has_audio" not in item))
+            if needs:
+                info = media_io.probe(item["file"])
+                if not item.get("width") and info.get("width"):
+                    item["width"] = info["width"]
+                if not item.get("height") and info.get("height"):
+                    item["height"] = info["height"]
+                if not item.get("duration") and info.get("duration"):
+                    item["duration"] = info["duration"]
+                if kind == "video" and "has_audio" not in item:
+                    item["has_audio"] = bool(info.get("has_audio"))
+            # nodes.py treats a missing audio_mode as "paired"; make that
+            # explicit so every client-side count agrees with what is sent.
+            if kind == "video" and item.get("has_audio") \
+                    and not item.get("audio_mode"):
+                item["audio_mode"] = "paired"
+        return web.json_response({"name": name, "items": kept,
+                                 "missing": missing,
+                                 "category": (data.get("category") or "").strip(),
+                                 "digest": _set_digest(items)})
+
+    @routes.post("/h3image/presets/delete")
+    @_guard()
+    async def delete_preset(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _preset_path(body.get("name"))
+        if not path or not os.path.exists(path):
+            return web.json_response({"error": "preset not found"}, status=404)
+        # The guarantee _preset_path gives is re-asserted here, beside the
+        # destructive call it protects, so no refactor can separate them.
+        if not _contained(path, _preset_dir()):
+            return web.json_response({"error": "refused"}, status=400)
+        try:
+            os.remove(path)
+        except Exception as exc:
+            return web.json_response({"error": f"delete failed: {exc}"}, status=500)
+        return web.json_response({"deleted": name})
+
+    # -- RefMod presets ---------------------------------------------------
+    # A saved stack: picks with weights and switches. Same shape of routes
+    # as the media presets, one flat namespace, categories as a view.
+
+    def _refmod_names():
+        base = _refmod_preset_dir()
+        try:
+            return sorted((f[:-5] for f in os.listdir(base) if f.endswith(".json")), key=str.lower)
+        except Exception:
+            return []
+
+    @routes.get("/h3image/refmod_presets")
+    async def list_refmod_presets(request):
+        entries, categories = [], set()
+        base = _refmod_preset_dir()
+        for n in _refmod_names():
+            data = _read_prompt(os.path.join(base, n + ".json")) or {}
+            cat = (data.get("category") or "").strip()
+            if cat:
+                categories.add(cat)
+            picks = [p for p in (data.get("picks") or []) if isinstance(p, dict)]
+            entries.append({"name": n, "category": cat, "count": len(picks),
+                            "on": sum(1 for p in picks if p.get("on") is not False)})
+        return web.json_response({"presets": entries, "categories": sorted(categories, key=str.lower)})
+
+    @routes.post("/h3image/refmod_presets/save")
+    @_guard()
+    async def save_refmod_preset(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _refmod_preset_path(body.get("name"))
+        if not path:
+            return web.json_response({"error": "give the preset a name"}, status=400)
+        if not isinstance(body.get("picks"), list):
+            return web.json_response({"error": "picks must be a list"}, status=400)
+        picks = _clean_picks(body["picks"])
+        previous = _read_prompt(path) or {}
+        category = body.get("category")
+        if category is None:
+            category = previous.get("category") or ""
+        record = {"version": 1, "picks": picks, "category": str(category).strip()}
+        try:
+            _write_json(path, record)
+        except Exception as exc:
+            return web.json_response({"error": f"save failed: {exc}"}, status=500)
+        return web.json_response({"name": name, "count": len(picks), "category": record["category"],
+                                  "digest": _picks_digest(picks)})
+
+    @routes.post("/h3image/refmod_presets/meta")
+    @_guard()
+    async def refmod_preset_meta(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _refmod_preset_path(body.get("name"))
+        if not path or not os.path.exists(path):
+            return web.json_response({"error": "preset not found"}, status=404)
+        data = _read_prompt(path)
+        if not data:
+            return web.json_response({"error": "preset unreadable"}, status=500)
+        data["category"] = str(body.get("category") or "").strip()
+        try:
+            _write_json(path, data)
+        except Exception as exc:
+            return web.json_response({"error": f"save failed: {exc}"}, status=500)
+        return web.json_response({"name": name, "category": data["category"]})
+
+    @routes.post("/h3image/refmod_presets/category")
+    @_guard()
+    async def refmod_preset_category(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        src_cat = (body.get("from") or "").strip()
+        dst_cat = (body.get("to") or "").strip()
+        if not src_cat:
+            return web.json_response({"error": "missing category"}, status=400)
+        base = _refmod_preset_dir()
+        changed = 0
+        for n in _refmod_names():
+            p = os.path.join(base, n + ".json")
+            data = _read_prompt(p)
+            if not data or (data.get("category") or "").strip() != src_cat:
+                continue
+            data["category"] = dst_cat
+            try:
+                _write_json(p, data)
+                changed += 1
+            except Exception:
+                pass
+        return web.json_response({"changed": changed})
+
+    @routes.post("/h3image/refmod_presets/match")
+    @_guard()
+    async def match_refmod_preset(request):
+        """Which saved preset, if any, IS this stack? Compared on what the
+        model receives, so weights count and switched-off picks don't."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        if not isinstance(body.get("picks"), list):
+            return web.json_response({"error": "picks must be a list"}, status=400)
+        want = _picks_digest(body["picks"])
+        base = _refmod_preset_dir()
+        for n in _refmod_names():
+            data = _read_prompt(os.path.join(base, n + ".json")) or {}
+            if _picks_digest(data.get("picks")) == want:
+                return web.json_response({"name": n, "digest": want})
+        return web.json_response({"name": None, "digest": want})
+
+    @routes.post("/h3image/refmod_presets/load")
+    @_guard()
+    async def load_refmod_preset(request):
+        from . import refmods
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _refmod_preset_path(body.get("name"))
+        if not path or not os.path.exists(path):
+            return web.json_response({"error": "preset not found"}, status=404)
+        data = _read_prompt(path)
+        picks = data.get("picks") if isinstance(data, dict) else None
+        if not isinstance(picks, list):
+            return web.json_response({"error": "preset has no picks"}, status=500)
+        # Previews and token costs come from the library as it stands now;
+        # files that have gone are reported rather than failing at queue time.
+        library = {}
+        try:
+            for it in refmods.scan_library()["items"]:
+                for k in ("visual", "audio"):
+                    if it.get(k):
+                        library[it[k]["file"]] = (it, it[k])
+        except Exception:
+            library = {}
+        kept, missing = [], []
+        for p in _clean_picks(picks):
+            gone = []
+            for k in ("visual", "audio"):
+                ch = p.get(k)
+                if not ch:
+                    continue
+                hit = library.get(ch["file"])
+                if hit:
+                    it, lc = hit
+                    ch["kind"] = lc.get("kind") or ch.get("kind")
+                    ch["tokens"] = lc.get("tokens", 0)
+                    if lc.get("seconds") is not None:
+                        ch["seconds"] = lc["seconds"]
+                    p["preview"] = it.get("preview")
+                elif not refmods.resolve_file(ch["file"], (".safetensors",)):
+                    gone.append(ch["file"])
+            if gone:
+                missing.extend(gone)
+                p["missing"] = gone
+            kept.append(p)
+        return web.json_response({"name": name, "picks": kept, "missing": missing,
+                                 "category": (data.get("category") or "").strip(),
+                                 "digest": _picks_digest(picks)})
+
+    @routes.post("/h3image/refmod_presets/delete")
+    @_guard()
+    async def delete_refmod_preset(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _refmod_preset_path(body.get("name"))
+        if not path or not os.path.exists(path):
+            return web.json_response({"error": "preset not found"}, status=404)
+        if not _contained(path, _refmod_preset_dir()):
+            return web.json_response({"error": "refused"}, status=400)
+        try:
+            os.remove(path)
+        except Exception as exc:
+            return web.json_response({"error": f"delete failed: {exc}"}, status=500)
+        return web.json_response({"deleted": name})
+
+    # -- drafts -----------------------------------------------------------
+    # Scratch space for the editor's Draft mode. One file, a keyed map, an
+    # LRU cap. The client never sends the whole map — each save replaces one
+    # key server-side — so two tabs writing different drafts can't clobber
+    # each other by holding stale copies.
+
+    @routes.post("/h3image/drafts/load")
+    @_guard()
+    async def draft_load(request):
+        body = await request.json()
+        draft_id = str(body.get("id") or "").strip()
+        if not draft_id:
+            return web.json_response({"error": "missing draft id"}, status=400)
+        entry = _read_drafts()["drafts"].get(draft_id)
+        return web.json_response({"exists": entry is not None,
+                                  "draft": entry})
+
+    @routes.post("/h3image/drafts/save")
+    @_guard()
+    async def draft_save(request):
+        body = await request.json()
+        draft_id = str(body.get("id") or "").strip()
+        if not draft_id:
+            return web.json_response({"error": "missing draft id"}, status=400)
+        payload = body.get("draft")
+        data = _read_drafts()
+        if not isinstance(payload, dict):
+            # An empty payload is a clear — the no-empty-drafts rule lives
+            # client-side, but honour the shape here too.
+            data["drafts"].pop(draft_id, None)
+        else:
+            payload["updated"] = time.time()
+            data["drafts"][draft_id] = payload
+            if len(data["drafts"]) > DRAFT_CAP:
+                keep = sorted(data["drafts"].items(),
+                              key=lambda kv: kv[1].get("updated", 0),
+                              reverse=True)[:DRAFT_CAP]
+                data["drafts"] = dict(keep)
+        try:
+            _write_json(_drafts_file(), data)
+        except Exception as exc:
+            return web.json_response({"error": f"save failed: {exc}"},
+                                     status=500)
+        return web.json_response({"saved": bool(isinstance(payload, dict)),
+                                  "count": len(data["drafts"])})
+
+    @routes.get("/h3image/drafts")
+    async def draft_count(request):
+        return web.json_response({"count": len(_read_drafts()["drafts"])})
+
+    @routes.post("/h3image/drafts/clear_all")
+    @_guard()
+    async def draft_clear_all(request):
+        data = _read_drafts()
+        n = len(data["drafts"])
+        data["drafts"] = {}
+        try:
+            _write_json(_drafts_file(), data)
+        except Exception as exc:
+            return web.json_response({"error": f"clear failed: {exc}"},
+                                     status=500)
+        return web.json_response({"cleared": n, "count": 0})
+
+    @routes.post("/h3image/drafts/clear")
+    @_guard()
+    async def draft_clear(request):
+        body = await request.json()
+        draft_id = str(body.get("id") or "").strip()
+        data = _read_drafts()
+        existed = data["drafts"].pop(draft_id, None) is not None
+        try:
+            _write_json(_drafts_file(), data)
+        except Exception as exc:
+            return web.json_response({"error": f"clear failed: {exc}"},
+                                     status=500)
+        return web.json_response({"cleared": existed,
+                                  "count": len(data["drafts"])})
+
+    # -- prompt library ---------------------------------------------------
+
+    @routes.get("/h3image/phrases")
+    async def list_phrases(request):
+        items = _read_phrases()
+        cats = sorted({(i.get("category") or "").strip()
+                       for i in items if (i.get("category") or "").strip()},
+                      key=str.lower)
+        return web.json_response({"phrases": items, "categories": cats})
+
+    @routes.post("/h3image/phrases/save")
+    @_guard()
+    async def save_phrase(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name = str(body.get("name") or "").strip()
+        text = str(body.get("text") or "")
+        if not name:
+            return web.json_response({"error": "give the phrase a name"}, status=400)
+        if not text.strip():
+            return web.json_response({"error": "the phrase is empty"}, status=400)
+
+        items = _read_phrases()
+        entry = {
+            "id": str(body.get("id") or "").strip() or f"p{int(time.time() * 1000)}",
+            "name": name[:120],
+            "category": str(body.get("category") or "").strip()[:80],
+            "text": text,
+            "updated": int(time.time()),
+        }
+        items = [i for i in items if i.get("id") != entry["id"]]
+        items.append(entry)
+        items.sort(key=lambda i: ((i.get("category") or "").lower(),
+                                  (i.get("name") or "").lower()))
+        try:
+            _write_phrases(items)
+        except Exception as exc:
+            return web.json_response({"error": f"could not save: {exc}"}, status=500)
+        return web.json_response({"saved": entry["id"]})
+
+    @routes.post("/h3image/phrases/delete")
+    @_guard()
+    async def delete_phrase(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        pid = str(body.get("id") or "").strip()
+        items = _read_phrases()
+        keep = [i for i in items if i.get("id") != pid]
+        if len(keep) == len(items):
+            return web.json_response({"error": "no such phrase"}, status=404)
+        try:
+            _write_phrases(keep)
+        except Exception as exc:
+            return web.json_response({"error": f"could not delete: {exc}"}, status=500)
+        return web.json_response({"deleted": pid})
+
+    @routes.get("/h3image/prompts")
+    async def list_prompts(request):
+        entries, categories = [], set()
+        directory = _prompt_dir()
+        # Counts for linked presets, read fresh rather than stored on the
+        # prompt: a preset edited after linking would otherwise show the
+        # composition it had at link time, which is exactly the kind of
+        # quietly-stale number this pack keeps getting bitten by. Each
+        # distinct preset is read once per request.
+        preset_counts = {}
+
+        refmod_counts = {}
+
+        def refmod_count_for(preset_name):
+            if not preset_name:
+                return None
+            if preset_name not in refmod_counts:
+                _n, p = _refmod_preset_path(preset_name)
+                data = _read_prompt(p) if p else None
+                picks = [x for x in ((data or {}).get("picks") or []) if isinstance(x, dict)]
+                refmod_counts[preset_name] = (sum(1 for x in picks if x.get("on") is not False)
+                                              if data else None)
+            return refmod_counts[preset_name]
+
+        def counts_for(preset_name):
+            if preset_name in preset_counts:
+                return preset_counts[preset_name]
+            out = None
+            slug = _slug(preset_name)
+            if not slug:            # a name that slugs to nothing has no file
+                preset_counts[preset_name] = None
+                return None
+            data = _read_prompt(os.path.join(_preset_dir(), slug + ".json"))
+            if data:
+                items = [i for i in (data.get("items") or [])
+                         if isinstance(i, dict) and i.get("enabled") is not False]
+                out = {k: sum(1 for i in items if i.get("kind") == k)
+                       for k in ("picture", "video", "audio")}
+            preset_counts[preset_name] = out
+            return out
+
+        try:
+            names = [f for f in os.listdir(directory) if f.endswith(".json")]
+        except Exception:
+            names = []
+        for fn in names:
+            data = _read_prompt(os.path.join(directory, fn))
+            if not data:
+                continue
+            category = (data.get("category") or "").strip()
+            if category:
+                categories.add(category)
+            text = data.get("prompt") or ""
+            entries.append({
+                "id": fn[:-5],
+                "name": data.get("name") or fn[:-5],
+                "category": category,
+                "favorite": bool(data.get("favorite")),
+                "mode": data.get("mode") or "",
+                "updated": data.get("updated") or 0,
+                "refs": data.get("refs") or 0,
+                "media_preset": data.get("media_preset") or None,
+                "media_counts": (counts_for(data["media_preset"])
+                                 if data.get("media_preset") else None),
+                "refmod_preset": data.get("refmod_preset") or None,
+                "refmod_count": refmod_count_for(data.get("refmod_preset")),
+                "preview": " ".join(text.split())[:150],
+            })
+        entries.sort(key=lambda e: (not e["favorite"], -float(e["updated"] or 0),
+                                    e["name"].lower()))
+        return web.json_response({
+            "prompts": entries,
+            "categories": sorted(categories, key=str.lower),
+        })
+
+    @routes.post("/h3image/prompts/save")
+    @_guard()
+    async def save_prompt(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        name = (body.get("name") or "").strip()
+        entry_id, path = _prompt_path(body.get("id") or name)
+        if not path:
+            return web.json_response({"error": "give the prompt a name"},
+                                     status=400)
+        if not isinstance(body.get("state"), dict):
+            return web.json_response({"error": "missing editor state"}, status=400)
+        # A save that believes it is creating a prompt must not quietly land
+        # on an existing file: two names can slug to the same id, and a
+        # colliding save used to overwrite the older prompt without a word.
+        # The client resends without the flag once the user confirms.
+        if body.get("expect_new") and os.path.exists(path):
+            return web.json_response(
+                {"error": f'a prompt named "{name or entry_id}" already exists',
+                 "exists": True}, status=409)
+        previous = _read_prompt(path) or {}
+        record = {
+            "version": 1,
+            "name": name or entry_id,
+            "category": (body.get("category") or "").strip(),
+            "favorite": bool(body.get("favorite", previous.get("favorite"))),
+            "mode": body.get("mode") or "",
+            "refs": body.get("refs") or 0,
+            # Optional link to a media preset, plus the digest of that preset
+            # as it stood when linked. Reference tags are positional, so a
+            # preset edited afterwards can silently retarget <Picture 3> —
+            # the digest is what lets the load path say so.
+            "media_preset": (body.get("media_preset") or "").strip() or None,
+            "media_digest": (body.get("media_digest") or "").strip() or None,
+            "refmod_preset": (body.get("refmod_preset") or "").strip() or None,
+            "refmod_digest": (body.get("refmod_digest") or "").strip() or None,
+            "prompt": body.get("prompt") or "",
+            "state": body["state"],
+            "created": previous.get("created") or time.time(),
+            "updated": time.time(),
+        }
+        try:
+            _write_json(path, record)
+        except Exception as exc:
+            return web.json_response({"error": f"save failed: {exc}"}, status=500)
+        # Renaming writes a new file; drop the old one — but ONLY when the
+        # client says this save IS a rename. Deleting on every name change
+        # ate the loaded prompt whenever someone saved a variant under a new
+        # name, which read as "the library is losing prompts".
+        old = _slug(body.get("rename_from"))
+        if body.get("rename") and old and old != entry_id:
+            old_path = os.path.join(_prompt_dir(), old + ".json")
+            if _contained(old_path, _prompt_dir()):
+                try:
+                    os.remove(old_path)
+                except Exception:
+                    pass
+        return web.json_response({"id": entry_id, "name": record["name"]})
+
+    @routes.post("/h3image/prompts/load")
+    @_guard()
+    async def load_prompt(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        entry_id, path = _prompt_path(body.get("id"))
+        data = _read_prompt(path) if path else None
+        if not data:
+            return web.json_response({"error": "prompt not found"}, status=404)
+        return web.json_response({"id": entry_id, **data})
+
+    @routes.post("/h3image/prompts/meta")
+    @_guard()
+    async def update_prompt_meta(request):
+        """Toggle favourite or move to another category without a full save."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        entry_id, path = _prompt_path(body.get("id"))
+        data = _read_prompt(path) if path else None
+        if not data:
+            return web.json_response({"error": "prompt not found"}, status=404)
+        if "favorite" in body:
+            data["favorite"] = bool(body["favorite"])
+        if "category" in body:
+            data["category"] = (body.get("category") or "").strip()
+        data["updated"] = time.time()
+        try:
+            _write_json(path, data)
+        except Exception as exc:
+            return web.json_response({"error": f"update failed: {exc}"}, status=500)
+        return web.json_response({"id": entry_id, "favorite": data["favorite"],
+                                  "category": data["category"]})
+
+    @routes.post("/h3image/prompts/category")
+    @_guard()
+    async def rename_category(request):
+        """Rename a category across every prompt, or clear it entirely."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        source = (body.get("from") or "").strip()
+        target = (body.get("to") or "").strip()
+        if not source:
+            return web.json_response({"error": "missing category"}, status=400)
+        directory = _prompt_dir()
+        changed = 0
+        try:
+            names = [f for f in os.listdir(directory) if f.endswith(".json")]
+        except Exception:
+            names = []
+        for fn in names:
+            path = os.path.join(directory, fn)
+            data = _read_prompt(path)
+            if not data or (data.get("category") or "").strip() != source:
+                continue
+            data["category"] = target
+            data["updated"] = time.time()
+            try:
+                _write_json(path, data)
+                changed += 1
+            except Exception:
+                pass
+        return web.json_response({"from": source, "to": target, "changed": changed})
+
+    @routes.post("/h3image/prompts/delete")
+    @_guard()
+    async def delete_prompt(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        entry_id, path = _prompt_path(body.get("id"))
+        if not path or not os.path.exists(path):
+            return web.json_response({"error": "prompt not found"}, status=404)
+        if not _contained(path, _prompt_dir()):
+            return web.json_response({"error": "refused"}, status=400)
+        try:
+            os.remove(path)
+        except Exception as exc:
+            return web.json_response({"error": f"delete failed: {exc}"}, status=500)
+        return web.json_response({"deleted": entry_id})
+
+    # /h3image/probe was removed in 1.6.2 (security): nothing in the pack called it
+    # (upload and extract_audio return their own probe data, and presets/load
+    # heals metadata server-side), and an uncalled endpoint that feeds an
+    # attacker-supplied path into media probing is pure attack surface.

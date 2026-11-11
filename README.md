@@ -1,50 +1,56 @@
 # ComfyUI-H3Image-MediaLoader
 
-Isolated extension nodepack for the **official MiniMax-H3-Image** model (released 2026-11-10).
+Media loader for the official **MiniMax-H3-Image** model in ComfyUI.
 
-H3-Image supports up to **16 reference images** (addressed as `Picture 1` … `Picture 16` in the prompt).  
-This pack provides a high-quality Media Loader that carries over all the QoL features from [Adudeguyman's Fantastic H3 Media Loader](https://github.com/Adudeguyman/ComfyUI-Fantastic-MiniMaxH3-PromptBuilder) while keeping the code completely separate.
+H3-Image accepts up to **16 reference images** (`Picture 1` … `Picture 16`). This pack provides a loader with the same quality-of-life features as the Fantastic H3 Media Loader, adapted for the image model and kept as a separate nodepack so it can be installed alongside the original.
+
+## Features
+
+- Drag-and-drop or file-picker loading for up to 16 images
+- Crop, mirror, rotate, resize, and enable/disable per slot
+- Live previews and reorderable slots
+- Single `references` output on the loader (no cluttered node)
+- Separate splitter that expands the bundle into individual `picture_1` … `picture_16` IMAGE outputs
+- Preset save/load for media sets
 
 ## Nodes
 
-| Node | Purpose |
-|------|---------|
-| **Fantastic H3-Image Media Loader (16 refs)** | Drag-and-drop / file-picker loader for up to 16 images. Supports crop, mirror, rotate, resize, enable/disable, previews. Outputs a single `references` bundle (clean node — no 16 outputs cluttering the graph). |
-| **Fantastic H3-Image Reference Splitter** | Fans the bundle out into individual `picture_1` … `picture_16` IMAGE slots for wiring into MiniMax H3 Image Conditioning. |
+| Node | Description |
+|------|-------------|
+| **Fantastic H3-Image Media Loader (16 refs)** | Loads and manages up to 16 reference images. Outputs a single `references` bundle. |
+| **Fantastic H3-Image Reference Splitter** | Splits the bundle into individual `picture_1` … `picture_16` IMAGE slots for use with MiniMax H3 Image Conditioning. |
 
-## Why a separate pack?
+## Installation
 
-- Isolates our changes from the original video-focused nodepack.
-- Tailored for the image model (no unnecessary video/audio complexity unless you later enable it).
-- Official H3-Image is image-only; video references are not supported by the model.
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/YOUR_USERNAME/ComfyUI-H3Image-MediaLoader.git
+```
 
-## Install
+Restart ComfyUI. The nodes appear under the image models / conditioning category.
 
-1. Delete any previous copy of this pack from `ComfyUI/custom_nodes/`.
-2. Extract the tar.gz so you end up with `ComfyUI/custom_nodes/ComfyUI-H3Image-MediaLoader/`.
-3. Fully quit ComfyUI, then start it again.
-4. In the browser, hard-refresh (Ctrl+Shift+R) so the old `medialoader.js` is not cached.
-
-After that the Media Loader node should show only the `references` output plus the panel buttons ("Open loader…" and "+ Image splitter"). The 16 individual image slots live on the Splitter node.
+**Requirements:** ComfyUI with native MiniMax-H3-Image support, and PyAV (already required by ComfyUI).
 
 ## Usage
 
-1. Add the **Fantastic H3-Image Media Loader** node.
-2. Drag images onto it (or use the file picker). Reorder, crop, rotate, etc. as needed.
-3. Click **+ Image splitter** (or add the splitter node manually) and wire the loader's `references` output to it.
-4. Wire the splitter's `picture_1` … `picture_16` outputs into **MiniMax H3 Image Conditioning**.
-5. Refer to them in your prompt as `Picture 1`, `Picture 2`, …
+1. Add **Fantastic H3-Image Media Loader** to the graph.
+2. Load images by dragging them onto the panel or using the file picker. Reorder, crop, rotate, or disable slots as needed.
+3. Click **+ Image splitter** (or add the splitter node manually) and connect the loader’s `references` output to the splitter.
+4. Connect the splitter’s `picture_1` … `picture_16` outputs to **MiniMax H3 Image Conditioning**.
+5. Reference the images in the prompt as `Picture 1`, `Picture 2`, and so on.
 
-`Picture 1` is conventionally the image you are editing; the rest are references (products, style, identity, etc.).
+`Picture 1` is conventionally the image being edited; the remaining slots are references (style, identity, products, etc.).
 
-## Video support
+## Notes
 
-The official H3-Image model does not document video reference support (unlike the original H3 video model).  
-This loader is image-focused. If you drop a video, the frontend may still accept it for frame extraction experiments, but it is not wired as a native video reference.
+- This pack is image-focused. The official H3-Image model does not support video references.
+- It is designed to coexist with the original Fantastic H3 nodepack. Routes and the frontend extension are namespaced to avoid conflicts.
+- Panel layout and slot sizing are tuned for a 4×4 grid of square previews.
 
 ## Credits
 
-QoL features, media decoding, and frontend panel adapted from  
-[Adudeguyman/ComfyUI-Fantastic-MiniMaxH3-PromptBuilder](https://github.com/Adudeguyman/ComfyUI-Fantastic-MiniMaxH3-PromptBuilder)  
-(MIT license). This pack is a separate derivative focused on the image model.
-"# ComfyUI-H3Image-MediaLoader" 
+Quality-of-life features, media handling, and the frontend panel are adapted from [Adudeguyman/ComfyUI-Fantastic-MiniMaxH3-PromptBuilder](https://github.com/Adudeguyman/ComfyUI-Fantastic-MiniMaxH3-PromptBuilder) (MIT). This repository is a separate derivative focused on the H3-Image model.
+
+## License
+
+MIT

@@ -116,12 +116,18 @@ class MiniMaxH3ImageMediaLoader:
 
 
 class MiniMaxH3ImageReferenceSplitter:
-    """Fan the image references bundle into individual picture slots (1-16)."""
+    """Fan image references into individual picture slots (1-16).
+
+    Accepts either the Media Loader's references bundle, or a batch IMAGE
+    tensor (e.g. from a Load Image Batch or similar node). When both are
+    connected, the batch overrides the bundle.
+    """
 
     CATEGORY = "conditioning/image_models"
     DESCRIPTION = (
-        "Split a H3-Image references bundle into individual picture_1 .. picture_16 IMAGE outputs "
-        "for wiring into MiniMaxH3ImageConditioning."
+        "Split references into individual picture_1 .. picture_16 IMAGE outputs "
+        "for wiring into MiniMaxH3ImageConditioning. Accepts the Media Loader bundle "
+        "or a batch IMAGE (batch overrides bundle when both are connected)."
     )
 
     RETURN_TYPES = ("IMAGE",) * PICTURES
@@ -131,15 +137,27 @@ class MiniMaxH3ImageReferenceSplitter:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
+            "optional": {
                 "references": ("H3_IMAGE_REFS",),
+                "images": ("IMAGE",),
             }
         }
 
-    def split(self, references):
+    def split(self, references=None, images=None):
         pics = []
-        if isinstance(references, dict):
+
+        # Batch IMAGE overrides the bundle when connected.
+        if images is not None:
+            # images: [B, H, W, C] — each slice is one picture
+            try:
+                batch = images.shape[0] if hasattr(images, "shape") else len(images)
+            except Exception:
+                batch = 0
+            for i in range(min(batch, PICTURES)):
+                pics.append(images[i:i+1])
+        elif isinstance(references, dict):
             pics = list(references.get("pictures") or [])
+
         pics = pics[:PICTURES] + [None] * (PICTURES - len(pics))
         return tuple(pics)
 

@@ -18,7 +18,7 @@ H3-Image accepts up to **16 reference images** (`Picture 1` … `Picture 16`). T
 | Node | Description |
 |------|-------------|
 | **Fantastic H3-Image Media Loader (16 refs)** | Loads and manages up to 16 reference images. Outputs a single `references` bundle. |
-| **Fantastic H3-Image Reference Splitter** | Splits the bundle into individual `picture_1` … `picture_16` IMAGE slots for use with MiniMax H3 Image Conditioning. |
+| **Fantastic H3-Image Reference Splitter** | Splits into individual `picture_1` … `picture_16` IMAGE slots. Accepts the Media Loader bundle or a batch IMAGE (batch overrides when both are connected). |
 
 ## Installation
 
@@ -35,7 +35,7 @@ Restart ComfyUI. The nodes appear under the image models / conditioning category
 
 1. Add **Fantastic H3-Image Media Loader** to the graph.
 2. Load images by dragging them onto the panel or using the file picker. Reorder, crop, rotate, or disable slots as needed.
-3. Click **+ Image splitter** (or add the splitter node manually) and connect the loader’s `references` output to the splitter.
+3. Click **+ Image splitter** (or add the splitter node manually). Connect the loader’s `references` output to the splitter, **or** connect a batch IMAGE to the splitter’s `images` input.
 4. Connect the splitter’s `picture_1` … `picture_16` outputs to **MiniMax H3 Image Conditioning**.
 5. Reference the images in the prompt as `Picture 1`, `Picture 2`, and so on.
 

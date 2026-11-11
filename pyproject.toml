@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-h3image-media-loader"
 version = "1.0.0"
-description = "Isolated Media Loader for official MiniMax-H3-Image supporting up to 16 reference images. Carries over drag-and-drop, crop, mirror, rotate, resize and other QoL from the Fantastic H3 Media Loader while keeping the code separate."
+description = "Media loader for official MiniMax-H3-Image. Supports up to 16 reference images with drag-and-drop, crop, mirror, rotate, resize, and preset QoL. Separate from the Fantastic H3 video nodepack."
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = ["av"]

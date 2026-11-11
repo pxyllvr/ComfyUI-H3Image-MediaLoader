@@ -418,7 +418,10 @@ export function scaleOverlay(node, boxes) {
 export function applyTextScale(panel, factor) {
   const f = clampScale(factor, TEXT_SCALE_MAX);
   try {
-    document.documentElement.style.setProperty("--mml-fs", String(f));
+    // Set on the panel root (not documentElement) so we don't clobber the
+    // original Fantastic H3 Media Loader's text scale.
+    const target = panel?.root || panel;
+    if (target?.style) target.style.setProperty("--mml-fs", String(f));
   } catch (e) { /* nothing to do */ }
 }
 
@@ -467,7 +470,7 @@ export function applyStoredScale(node, { force = false } = {}) {
 }
 
 const CSS = `
-.mml-panel{font-family:system-ui,sans-serif;color:#d7dbe2;font-size:calc(12px * var(--mml-fs, 1));
+.h3i.mml-panel{font-family:system-ui,sans-serif;color:#d7dbe2;font-size:calc(12px * var(--mml-fs, 1));
   background:#191c22;border:1px solid #2a2f3a;border-radius:8px;padding:8px;
   display:flex;flex-direction:column;gap:6px;box-sizing:border-box;
   width:100%;height:720px;min-height:720px;overflow:hidden;
@@ -552,18 +555,19 @@ const CSS = `
 .mml-sec span{margin-left:auto;text-transform:none;letter-spacing:0;color:#5c6472;
   font-family:ui-monospace,monospace;}
 
-.mml-pics{flex:0 0 auto;display:grid;
+.h3i .mml-pics{flex:0 0 auto;display:grid;
   grid-template-columns:repeat(4,130px);
   grid-template-rows:repeat(4,130px);
   gap:6px;
   justify-content:center;
   align-content:center;
   margin:4px 0;}
-.mml-pics .mml-slot{width:130px;height:130px;aspect-ratio:1 / 1;
+.h3i .mml-pics .mml-slot{width:130px;height:130px;aspect-ratio:1 / 1;
   box-sizing:border-box;}
-/* Image-only layout for H3-Image: hide video/audio sections and make pictures fill the panel evenly. */
-.mml-vids,.mml-auds,.mml-spacer{display:none !important;}
-.mml-cols{grid-template-columns:1fr !important;}
+/* Image-only layout for H3-Image: hide video/audio sections and make pictures fill the panel evenly.
+   Scoped under .h3i so these rules cannot affect the original Fantastic H3 Media Loader. */
+.h3i .mml-vids,.h3i .mml-auds,.h3i .mml-spacer{display:none !important;}
+.h3i .mml-cols{grid-template-columns:1fr !important;}
 /* flex-grow in the old fixed heights' ratio (46:38) so these sections take
    their share of a taller node instead of the pictures grid eating all of it.
    min-height keeps them at their original size at 100%. */
@@ -5178,7 +5182,7 @@ class LoaderPanel {
     this.players = [];
     injectCSS();
 
-    this.root = el("div", { class: "mml-panel" });
+    this.root = el("div", { class: "mml-panel h3i" });
     this.root.addEventListener("mousedown", (e) => {
       if (!e.target.closest(".mml-scalewrap")) this.closeScaleMenu();
       if (!e.target.closest(".mml-prefwrap")) this.closePrefMenu();
@@ -5213,6 +5217,21 @@ class LoaderPanel {
     this.render();
     this.refreshPresets();
     if (!this.store) setTimeout(() => this.maskCheck(), 4000);   // once the workflow has loaded
+
+    // Tab switches in ComfyUI hide/show the canvas without re-running
+    // onConfigure, so the panel size drifts. Re-apply whenever we become
+    // visible again.
+    if (typeof IntersectionObserver !== "undefined" && !this.store) {
+      this._visObs = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting && this.node) {
+            applyStoredScale(this.node);
+            break;
+          }
+        }
+      }, { threshold: 0.05 });
+      this._visObs.observe(this.root);
+    }
   }
 
   /** presetName survives every edit short of Unload, so it will happily
